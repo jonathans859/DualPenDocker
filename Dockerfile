@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1
+# check=skip=SecretsUsedInArgOrEnv
+# ^ BuildKit flags COLLAB_EDITOR_MASTER_KEY_PATH on the name alone. The value
+#   is a filesystem path, /data/master.key; the key itself is generated at
+#   runtime into the volume and never enters the image or the build context.
 
 # DualPen as a single container: uvicorn serves /api, /ws and the built
 # frontend from one port, so the browser always sees a single origin. That
