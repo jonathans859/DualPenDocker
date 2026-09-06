@@ -1,0 +1,10 @@
+# core.autocrlf=true on a Windows checkout would hand a CRLF Dockerfile to a
+# local `docker build`, where a line continuation becomes "\<CR>" and the
+# build breaks in a way that is tedious to diagnose. Same story for the shell
+# blocks inside the workflow files. Pin the files that only ever run on Linux
+# to LF in the working tree.
+Dockerfile        text eol=lf
+.dockerignore     text eol=lf
+*.yaml            text eol=lf
+*.yml             text eol=lf
+docker/*.py       text eol=lf

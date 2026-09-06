@@ -1,0 +1,14 @@
+# Build the image from this checkout instead of pulling it from ghcr.io:
+#
+#   docker compose -f compose.yaml -f compose.build.yaml up -d --build
+#
+# Kept as an override rather than a `build:` key in compose.yaml so that the
+# plain `docker compose up -d` always uses the published image and never
+# silently builds a local one that drifts from what CI produced.
+
+services:
+  app:
+    image: ${DUALPEN_IMAGE:-dualpen:local}
+    build:
+      context: .
+      dockerfile: Dockerfile

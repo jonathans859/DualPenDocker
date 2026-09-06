@@ -1,0 +1,131 @@
+name: Build and publish image
+
+# Builds the image, proves it works, then publishes to ghcr.io.
+#
+# Pull requests run every check but never push - so an upstream sync PR is
+# fully validated before it reaches main, and only main and tags produce
+# images anyone can pull.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # metadata-action lowercases the repository name for us; GHCR
+          # rejects uppercase in an image path.
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Built and loaded into the local daemon first so the next two steps
+      # can exercise the exact artifact that is about to be published. The
+      # publish step below reuses every layer from the shared cache, so this
+      # is not a second full build.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: dualpen:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # server/tests/conftest.py redirects the database, docstore and master
+      # key at a tmpdir before importing anything, so this never touches the
+      # /data paths the image is configured with.
+      - name: Run the backend test suite inside the image
+        run: |
+          docker run --rm -w /app/server dualpen:ci \
+            python -m pytest -q -p no:cacheprovider
+
+      # The frontend typecheck (`tsc`) already ran inside the image build,
+      # so a type error fails before we get here.
+      - name: Smoke test the running container
+        run: |
+          set -euo pipefail
+          docker run -d --name dualpen-smoke -p 127.0.0.1:8000:8000 dualpen:ci
+
+          # Wait for a settled verdict. Break only on a terminal status:
+          # .State.Health can read empty for a moment right after start, and
+          # treating that as "not starting" would race past the wait.
+          for _ in $(seq 1 60); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' dualpen-smoke 2>/dev/null || true)
+            case "$status" in healthy|unhealthy) break ;; esac
+            sleep 2
+          done
+          docker logs dualpen-smoke
+          test "$(docker inspect -f '{{.State.Health.Status}}' dualpen-smoke)" = healthy
+
+          # The static mount serves the built frontend at /. Captured to a
+          # variable rather than piped into grep: this shell runs with
+          # pipefail, and `grep -q` exiting early would SIGPIPE curl and fail
+          # the step on a success.
+          index=$(curl -fsS http://127.0.0.1:8000/)
+          grep -q '<title>DualPen</title>' <<<"$index"
+
+          # ...and the API routes still win over that catch-all mount, which
+          # is the one thing this single-container layout could get wrong.
+          # Unauthenticated /api/me is 401; a 404 would mean StaticFiles ate it.
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/me)
+          echo "GET /api/me -> $code"
+          test "$code" = 401
+
+          # The data directories the entrypoint is responsible for creating.
+          docker exec dualpen-smoke test -d /data/db
+          docker exec dualpen-smoke test -d /data/docstore
+
+          docker rm -f dualpen-smoke
+
+      - name: Publish to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

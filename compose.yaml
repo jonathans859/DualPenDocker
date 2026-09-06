@@ -1,0 +1,67 @@
+# DualPen as one container, meant to sit behind your own reverse proxy.
+#
+#   docker compose pull && docker compose up -d
+#
+# Then create the first account (interactive - it prompts for a password):
+#
+#   docker compose run --rm app python -m server.cli create-admin
+#
+# See DOCKER.md for proxy snippets, backups and upstream updates.
+
+name: dualpen
+
+services:
+  app:
+    image: ${DUALPEN_IMAGE:-ghcr.io/jonathans859/dualpendocker:latest}
+    restart: unless-stopped
+
+    # Upstream keeps the realtime sync rooms in one process's memory
+    # (server/app/routers/sync.py), so a second replica would not see the
+    # first one's edits and collaborators would silently diverge. Never
+    # scale this service above 1.
+    deploy:
+      replicas: 1
+
+    ports:
+      # Loopback only: your reverse proxy terminates TLS and should be the
+      # only thing that can reach this. The session cookie is not marked
+      # Secure upstream, so the browser-facing hop must be the proxy's HTTPS,
+      # never this port. Set DUALPEN_BIND=0.0.0.0 only if the proxy lives on
+      # another host and a firewall fronts it.
+      - "${DUALPEN_BIND:-127.0.0.1}:${DUALPEN_PORT:-8000}:8000"
+
+    volumes:
+      # Every piece of durable state: db/app.db, docstore/ (the encrypted
+      # document blobs), master.key and backups/. The three must be backed up
+      # together - a blob is unreadable without both the database that maps
+      # it and the key that decrypts it.
+      - dualpen_data:/data
+
+    # The image already points the COLLAB_EDITOR_* variables at /data;
+    # uncomment only to override them. COLLAB_EDITOR_CORS_ORIGINS is
+    # deliberately absent - with a single origin the browser never issues a
+    # cross-origin request, so there is nothing for CORS to allow.
+    # environment:
+    #   COLLAB_EDITOR_DATABASE_URL: sqlite+aiosqlite:////data/db/app.db
+    #   COLLAB_EDITOR_DOCSTORE_PATH: /data/docstore
+    #   COLLAB_EDITOR_MASTER_KEY_PATH: /data/master.key
+    #   COLLAB_EDITOR_BACKUP_PATH: /data/backups
+
+    healthcheck:
+      test: ["CMD", "python", "/app/docker/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # Give uvicorn room to close live WebSocket sessions before SIGKILL.
+    stop_grace_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  dualpen_data:

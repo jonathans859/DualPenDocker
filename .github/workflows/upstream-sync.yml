@@ -1,0 +1,141 @@
+name: Sync upstream
+
+# Watches TheGreatAthlon/DualPen and opens a PR here whenever it moves ahead,
+# so you get a notification instead of having to remember to check.
+#
+# The PR branch is pointed straight at the upstream commit rather than at a
+# locally-merged result. That way this job can always push something, even
+# when the merge would conflict - GitHub then shows the conflict on the PR
+# and you resolve it once, deliberately, instead of the job failing silently
+# in the middle of the night.
+#
+# Caveat worth knowing: a PR opened by GITHUB_TOKEN does not trigger other
+# workflows, so docker-publish.yml will not run on the PR itself. It runs on
+# the push to main once you merge it.
+
+on:
+  schedule:
+    # 04:17 UTC - an off-the-hour minute, since scheduled jobs on the hour
+    # queue behind everyone else's.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/TheGreatAthlon/DualPen.git
+  SYNC_BRANCH: upstream-sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          # Needed for merge-base and rev-list against upstream.
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_URL"
+
+          # Read the default branch off the remote instead of assuming
+          # "main", so a rename upstream doesn't turn into a silent no-op.
+          # Captured then fed in as a here-string: `awk ... exit` on the
+          # right of a pipe can SIGPIPE the left side, and this shell
+          # runs with pipefail.
+          symref=$(git ls-remote --symref upstream HEAD)
+          branch=$(awk '/^ref:/ { sub("refs/heads/", "", $2); print $2; exit }' <<<"$symref")
+          if [ -z "$branch" ]; then
+            echo "could not determine upstream default branch" >&2
+            exit 1
+          fi
+          echo "upstream default branch: $branch"
+          git fetch upstream "$branch"
+
+          {
+            echo "UPSTREAM_BRANCH=$branch"
+            echo "UPSTREAM_SHA=$(git rev-parse "upstream/$branch")"
+            echo "BEHIND=$(git rev-list --count "HEAD..upstream/$branch")"
+          } >> "$GITHUB_ENV"
+
+      - name: Report when already up to date
+        if: ${{ env.BEHIND == '0' }}
+        run: echo "Already up to date with upstream/$UPSTREAM_BRANCH - nothing to do."
+
+      - name: Test whether the merge is clean
+        if: ${{ env.BEHIND != '0' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git merge --no-commit --no-ff "upstream/$UPSTREAM_BRANCH" >/dev/null 2>&1; then
+            echo "MERGE_CLEAN=yes" >> "$GITHUB_ENV"
+          else
+            echo "MERGE_CLEAN=no" >> "$GITHUB_ENV"
+            git diff --name-only --diff-filter=U | sed 's/^/  /' > /tmp/conflicts.txt || true
+          fi
+          # Nothing is kept from the trial merge - the PR branch is the raw
+          # upstream commit.
+          git merge --abort 2>/dev/null || git reset --hard HEAD
+
+      - name: Push the sync branch
+        if: ${{ env.BEHIND != '0' }}
+        run: |
+          git push --force origin "$UPSTREAM_SHA:refs/heads/$SYNC_BRANCH"
+
+      - name: Open or update the pull request
+        if: ${{ env.BEHIND != '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "Upstream [\`TheGreatAthlon/DualPen\`](https://github.com/TheGreatAthlon/DualPen) is **$BEHIND commit(s) ahead**."
+            echo
+            echo "Upstream HEAD: \`$UPSTREAM_SHA\` (\`$UPSTREAM_BRANCH\`)"
+            echo
+            if [ "$MERGE_CLEAN" = yes ]; then
+              echo "A trial merge into \`main\` applied cleanly. ✅"
+            else
+              echo "⚠️ A trial merge into \`main\` **conflicted** in:"
+              echo
+              echo '```'
+              cat /tmp/conflicts.txt
+              echo '```'
+              echo
+              echo "This fork is meant to stay purely additive (Docker files only, no upstream file edited), so a conflict here means something in this fork has started editing an upstream file - worth fixing at the root."
+            fi
+            echo
+            echo "### New upstream commits"
+            echo
+            git log --no-merges --max-count=50 --format='- %h %s' "HEAD..upstream/$UPSTREAM_BRANCH"
+            echo
+            echo "---"
+            echo "Merging this PR triggers \`docker-publish.yml\` and republishes the image."
+          } > /tmp/pr-body.md
+
+          existing=$(gh pr list --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            echo "Updating existing PR #$existing"
+            gh pr edit "$existing" \
+              --title "Sync upstream ($BEHIND commit(s) behind)" \
+              --body-file /tmp/pr-body.md
+          else
+            gh pr create \
+              --base "${{ github.event.repository.default_branch }}" \
+              --head "$SYNC_BRANCH" \
+              --title "Sync upstream ($BEHIND commit(s) behind)" \
+              --body-file /tmp/pr-body.md
+          fi

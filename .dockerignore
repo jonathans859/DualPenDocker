@@ -1,0 +1,40 @@
+# Keep the build context small and, more importantly, keep host state out of
+# the image: server_data/ and backups/ hold the live database, the encrypted
+# document blobs and the master key. Baking those into a published image
+# would leak them to anyone who can pull it.
+server_data/
+backups/
+.venv/
+venv/
+
+.git/
+.github/
+.claude-notes/
+
+**/node_modules/
+**/dist/
+**/.vite/
+
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.env
+.env.*
+!.env.example
+
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Documentation and one-off dev scripts: not needed at runtime, and excluding
+# them means a README edit doesn't invalidate the Docker layer cache.
+*.md
+client/verify-phase*.mjs
+server/scripts_phase5_live_server.py
+create-user.ps1
