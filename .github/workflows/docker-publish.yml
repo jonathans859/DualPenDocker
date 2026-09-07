@@ -143,6 +143,11 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
+          # Push a single manifest. buildx otherwise attaches a provenance
+          # attestation as a second manifest under an index, which GHCR
+          # lists as two extra <untagged> versions on every build.
+          provenance: false
+          sbom: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
