@@ -97,6 +97,12 @@ jobs:
         if: ${{ env.BEHIND != '0' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This repo is a fork, and gh resolves the base repo for a
+          # fork to its parent - so gh would aim both the list and the
+          # create at TheGreatAthlon/DualPen, where GITHUB_TOKEN has no
+          # rights, and fail with "Resource not accessible by
+          # integration". Pin it to this repo instead.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
