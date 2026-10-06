@@ -42,6 +42,7 @@ import { MarkdownPreviewPanel } from "./markdown-preview";
 import { attachDocCollaboratorsList, type DocCollaboratorsList } from "./doc-collaborators";
 import { PresenceRosterPanel } from "./presence-roster";
 import { ShortcutsHelpPanel } from "./shortcuts-help";
+import { AdminPanel } from "./admin";
 
 const TRASH_FOLDER_NAME = "Trash";
 // Idle threshold after the last keystroke before a peer's isTyping flips back
@@ -80,6 +81,7 @@ let settingsPanel: SettingsPanel | null = null;
 let markdownPreviewPanel: MarkdownPreviewPanel | null = null;
 let presenceRosterPanel: PresenceRosterPanel | null = null;
 let shortcutsHelpPanel: ShortcutsHelpPanel | null = null;
+let adminPanel: AdminPanel | null = null;
 let treeRefreshTimer: number | null = null;
 // Tracks whether #move-status's live-region text was last set for "moving"
 // or "not moving", so updateTreeToolbar() (which reruns on every arrow-key
@@ -526,6 +528,7 @@ async function renderApp(): Promise<void> {
             <span id="tab-focus-indicator" role="status">Tab moves focus: OFF</span>
             <span id="doc-collaborators" role="status"></span>
             <button id="settings-btn" type="button">Settings</button>
+            ${currentUser?.is_admin ? '<button id="admin-btn" type="button">Admin</button>' : ""}
             <span id="save-status" role="status"></span>
           </div>
           <div id="editor-container" role="none"></div>
@@ -632,6 +635,7 @@ async function renderApp(): Promise<void> {
   setUpMarkdownPreview();
   setUpPresenceRoster();
   setUpShortcutsHelp();
+  setUpAdmin();
   setUpTreePolling();
 
   await refreshTree();
@@ -674,11 +678,30 @@ function setUpMonaco(): void {
   if (!container) return;
 
   currentModel = monaco.editor.createModel("", "plaintext");
+  // The "off" side of the accessibility toggle is "auto", not "off". Monaco
+  // documents "off" as "Assume a screen reader is not attached", and maps it
+  // to AccessibilitySupport.Disabled - which makes it replace the
+  // screen-reader content's aria-label with "The editor is not accessible at
+  // this time." (see monaco-editor's screenReaderUtils.js). That turns the
+  // toggle's off position into a dead end for anyone using a screen reader
+  // who hasn't found the setting yet. "auto" is Monaco's own default and
+  // leaves the real aria-label in place. It won't enable the screen-reader
+  // optimized path on its own - no browser API reports screen-reader
+  // presence, so "auto" stays Unknown on the web and the toggle still has to
+  // be on for that - but off now means "not optimized" rather than "actively
+  // announced as broken".
   monacoEditor = monaco.editor.create(container, {
     model: currentModel,
     automaticLayout: true,
     readOnly: true,
-    accessibilitySupport: loadAccessibilitySupportPref() ? "on" : "off",
+    accessibilitySupport: loadAccessibilitySupportPref() ? "on" : "auto",
+    // Monaco fills its screen-reader textarea with a page of accessibilityPageSize
+    // lines (default 500), and VoiceOver reads that whole field rather than the
+    // line the cursor is on. A page of 1 makes the field hold only the current
+    // line, so "read the whole field" and "read the current line" coincide. The
+    // trade-off is that a screen reader can no longer review surrounding lines
+    // from the field - acceptable here, since the editor is line-oriented.
+    accessibilityPageSize: loadAccessibilitySupportPref() ? 1 : 500,
     fontFamily: loadFontFamily(),
     fontSize: loadFontSize(),
   });
@@ -724,9 +747,21 @@ function setUpMonaco(): void {
 // queued unmodified arrow keypress finally moves the cursor by one
 // character, which reads as a "snap back". This binds Ctrl+Left/Right (and
 // Ctrl+Shift+Left/Right for extending the selection) directly to the plain
-// word commands, bypassing Monaco's self-disabling default entirely so the
-// keys work regardless of accessibility mode or OS.
+// word commands, bypassing Monaco's self-disabling default.
+//
+// Windows only, for two reasons. The `isWindows` half of that kbExpr means
+// the default never disables itself anywhere else, so there is nothing to
+// work around on macOS or Linux - Monaco's own binding is live and correct.
+// And monaco.KeyMod.CtrlCmd is Command, not Control, on macOS (see
+// keybindings.js: `metaKey = OS === Macintosh ? ctrlCmd : winCtrl`), so
+// binding it unconditionally stole Cmd+Left/Right - line start/end on a Mac -
+// and made it move by word instead, while Option+Left/Right kept working via
+// the untouched default. Monaco spells the platform split with a `mac:`
+// override on its own registration; here the whole workaround simply doesn't
+// apply off Windows.
 function bindCtrlArrowWordNavigation(editor: monaco.editor.IStandaloneCodeEditor): void {
+  if (!isWindows()) return;
+
   const bind = (keybinding: number, commandId: string) => {
     editor.addCommand(keybinding, () => {
       editor.trigger("wordNavigation", commandId, null);
@@ -743,6 +778,16 @@ function bindCtrlArrowWordNavigation(editor: monaco.editor.IStandaloneCodeEditor
     monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.RightArrow,
     "cursorWordStartRightSelect",
   );
+}
+
+// navigator.userAgentData is Chromium-only, so fall back to userAgent, which
+// reports "Windows NT" on every Windows browser including Firefox and the
+// Windows builds Monaco's own IsWindowsContext keys off.
+function isWindows(): boolean {
+  const platform = (navigator as Navigator & { userAgentData?: { platform?: string } })
+    .userAgentData?.platform;
+  if (platform) return platform === "Windows";
+  return navigator.userAgent.includes("Windows");
 }
 
 // Monaco's onDidChangeCursorSelection event doesn't say which key caused the
@@ -779,7 +824,10 @@ function setUpSettings(): void {
   if (!settingsPanel) {
     settingsPanel = new SettingsPanel({
       onAccessibilitySupportChange: (on) => {
-        monacoEditor?.updateOptions({ accessibilitySupport: on ? "on" : "off" });
+        monacoEditor?.updateOptions({
+          accessibilitySupport: on ? "on" : "auto",
+          accessibilityPageSize: on ? 1 : 500,
+        });
       },
       onFontChange: (family, size) => {
         monacoEditor?.updateOptions({ fontFamily: family, fontSize: size });
@@ -794,6 +842,14 @@ function setUpSettings(): void {
   document.querySelector<HTMLButtonElement>("#settings-btn")!.addEventListener("click", () => {
     settingsPanel?.openFocused();
   });
+}
+
+function setUpAdmin(): void {
+  const btn = document.querySelector<HTMLButtonElement>("#admin-btn");
+  if (!btn) return;
+  // Guarded singleton like setUpSettings(); dialog lives outside #app.
+  if (!adminPanel) adminPanel = new AdminPanel(() => currentUser?.id ?? null);
+  btn.addEventListener("click", () => void adminPanel?.open());
 }
 
 function setUpMarkdownPreview(): void {

@@ -113,6 +113,8 @@ async def import_zip(
     zip_bytes = await file.read()
     try:
         root, skipped = await import_export_service.import_zip(db, zip_bytes, file.filename, parent_id)
+    except import_export_service.ImportTooLargeError as e:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(e))
     except import_export_service.InvalidZipError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except node_service.InvalidParentError as e:

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,6 +10,7 @@ from server.app.auth import (
     SESSION_COOKIE_NAME,
 )
 from server.app.db import get_db
+from server.app.limits import login_rate_limit, refund_login_hit
 from server.app.models import Session, User
 from server.app.schemas import LoginRequest, UserOut
 from server.app.security import verify_password
@@ -17,18 +18,17 @@ from server.app.security import verify_password
 router = APIRouter(tags=["auth"])
 
 
-@router.post("/login", response_model=UserOut)
-async def login(payload: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)):
+@router.post("/login", response_model=UserOut, dependencies=[Depends(login_rate_limit)])
+async def login(payload: LoginRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.username == payload.username))
     user = result.scalar_one_or_none()
 
     invalid = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
 
-    if user is None or not user.is_active:
-        raise invalid
-    if not verify_password(user.password_hash, payload.password):
+    if user is None or not user.is_active or not verify_password(user.password_hash, payload.password):
         raise invalid
 
+    refund_login_hit(request)
     session = await create_session(db, user)
     set_session_cookie(response, session)
     return user

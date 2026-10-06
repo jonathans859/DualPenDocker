@@ -396,3 +396,70 @@ async def test_multi_client_room_teardown_only_when_empty(live_server, normal_us
     await asyncio.sleep(0.5)
 
     assert doc_id not in sync_module.websocket_server.rooms
+
+
+async def test_failed_seed_leaves_no_state(live_server, normal_user, monkeypatch):
+    from server.app.routers import sync
+
+    class FailingBroadcaster:
+        enabled = True
+        unsubscribed = []
+
+        async def subscribe(self, doc_id, cb):
+            raise RuntimeError("redis down")
+
+        async def unsubscribe(self, doc_id):
+            self.unsubscribed.append(doc_id)
+
+    fake = FailingBroadcaster()
+    monkeypatch.setattr(sync, "broadcaster", fake)
+    with pytest.raises(RuntimeError):
+        await sync._seed_room_from_disk("doc-x", "unused")
+    assert "doc-x" not in sync._seeded_doc_ids
+    assert "doc-x" not in sync._state_events
+    assert fake.unsubscribed == ["doc-x"]
+
+
+async def test_cancelled_seed_does_not_strand_waiting_joiner(live_server, normal_user, monkeypatch):
+    from server.app.routers import sync
+
+    class SlowFirstPublish:
+        enabled = True
+
+        def __init__(self):
+            self.publishes = 0
+
+        async def subscribe(self, doc_id, cb):
+            pass
+
+        async def unsubscribe(self, doc_id):
+            pass
+
+        async def publish(self, doc_id, kind, payload):
+            self.publishes += 1
+            if self.publishes == 1:
+                await asyncio.sleep(10)
+
+        def publish_nowait(self, *args):
+            pass
+
+    monkeypatch.setattr(sync, "broadcaster", SlowFirstPublish())
+    monkeypatch.setattr(sync, "STATE_WAIT_SECONDS", 0.01)
+    doc_id = "doc-y"
+    a = asyncio.ensure_future(sync._seed_room_from_disk(doc_id, "unused"))
+    await asyncio.sleep(0.05)
+    b = asyncio.ensure_future(sync._seed_room_from_disk(doc_id, "unused"))
+    await asyncio.sleep(0.05)
+    a.cancel()
+    room_b = await b
+    try:
+        assert await sync.websocket_server.get_room(doc_id) is room_b
+        assert doc_id in sync._seeded_doc_ids
+    finally:
+        sync._seeded_doc_ids.discard(doc_id)
+        for registry in (sync._observers, sync._update_observers):
+            obs = registry.pop(doc_id, None)
+            if obs is not None:
+                obs.drop()
+        sync._ready_doc_ids.discard(doc_id)
+        await sync.websocket_server.delete_room(room=room_b)

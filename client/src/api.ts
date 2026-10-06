@@ -44,7 +44,14 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       } else if (Array.isArray(body.detail)) {
         // FastAPI/Pydantic 422 validation errors: detail is a list of
         // {msg, loc, ...}, not a plain string.
-        detail = body.detail.map((d: { msg?: string }) => d.msg ?? String(d)).join("; ");
+        detail = body.detail
+          .map((d: { msg?: string; loc?: unknown[] }) => {
+            const last = Array.isArray(d.loc) ? d.loc[d.loc.length - 1] : "";
+            const field = typeof last === "string" ? last : "";
+            const msg = d.msg ?? String(d);
+            return field && field !== "body" ? `${field}: ${msg}` : msg;
+          })
+          .join("; ");
       }
     } catch {
       // ignore non-JSON error bodies
@@ -209,4 +216,35 @@ export async function exportZip(nodeId: string | null): Promise<{ blob: Blob; fi
   const match = /filename="([^"]+)"/.exec(disposition);
   const filename = match ? match[1] : "export.zip";
   return { blob: await resp.blob(), filename };
+}
+
+export function adminListUsers(): Promise<CurrentUser[]> {
+  return request("/admin/users");
+}
+
+export function adminCreateUser(
+  username: string,
+  displayName: string,
+  initialPassword: string,
+): Promise<CurrentUser> {
+  return request("/admin/users", {
+    method: "POST",
+    body: JSON.stringify({
+      username,
+      display_name: displayName,
+      initial_password: initialPassword,
+    }),
+  });
+}
+
+export function adminUpdateUser(
+  userId: number,
+  changes: {
+    display_name?: string;
+    new_password?: string;
+    is_admin?: boolean;
+    is_active?: boolean;
+  },
+): Promise<CurrentUser> {
+  return request(`/admin/users/${userId}`, { method: "PATCH", body: JSON.stringify(changes) });
 }

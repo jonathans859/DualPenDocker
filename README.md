@@ -25,7 +25,10 @@ screen-reader-accessible, so blind and sighted collaborators can edit documents 
 - Zip import and export, so you can easily migrate documents to or from DualPen
 - Server-wide AES-256-GCM encryption at rest for document content, argon2id-hashed
   passwords, and admin-managed accounts (no self-signup) with list/create/update
-  (rename, reset password, toggle admin/active) and deactivate (soft-delete) endpoints.
+  (rename, reset password, toggle admin/active) and deactivate (soft-delete) endpoints,
+  plus an in-app Admin dialog (toolbar button, admins only) over those endpoints.
+- Request body size cap, zip import limits, and in-process rate limiting (all configurable)
+- Optional Redis pub/sub for running multiple backend workers
 - Encrypted backup support
 
 ## Stack
@@ -47,9 +50,13 @@ cd server
 python -m venv ../.venv
 ../.venv/bin/activate      # or ..\.venv\Scripts\activate on Windows
 pip install -r requirements.txt
-python -m server.cli create-admin   # first-run only, interactive prompts
+python -m server.cli create-admin   # first-run only; prompts (password: 8+ characters)
 uvicorn server.app.main:app --reload --port 8000
 ```
+
+The session cookie is `Secure` by default. Chrome and Firefox accept it on
+`http://localhost`; Safari doesn't, so there set `COLLAB_EDITOR_COOKIE_SECURE=0` before
+starting the backend.
 
 Run from the **repository root**, not `server/` — the app is imported as `server.app.main`
 and reads/writes `server_data/` relative to the repo root.
@@ -182,15 +189,23 @@ sudo systemctl enable --now collab-editor-backup.timer
 **To restore:** stop the service, extract the archive's `db/app.db`, `docstore/`, and
 `master.key` into `server_data/` (overwriting what's there), then restart.
 
-Create the first admin account (interactive — do this over your SSH session, not
-scripted, since it prompts for username/display name/password):
+Create the first admin account. Interactive by default (prompts for
+username/display name/password):
 
 ```bash
 .venv/bin/python -m server.cli create-admin
 ```
 
-Additional users are created afterward from the admin account, via the app's admin API
-(no UI for this yet — gated by `is_admin`): `GET /api/admin/users` lists accounts,
+For scripted/provisioning use, pass `--username` (plus optional `--display-name`) and
+pipe the password in with `--password-stdin`, or set `COLLAB_EDITOR_ADMIN_USERNAME` /
+`COLLAB_EDITOR_ADMIN_PASSWORD`:
+
+```bash
+printf '%s' "$PW" | .venv/bin/python -m server.cli create-admin --username alice --password-stdin
+```
+
+Additional users are managed from the **Admin** button in the app toolbar (visible to
+admins only), or directly via the admin API (gated by `is_admin`): `GET /api/admin/users` lists accounts,
 `POST /api/admin/users` creates one, `PATCH /api/admin/users/{id}` updates display name,
 password, admin flag, or active flag, and `DELETE /api/admin/users/{id}` deactivates an
 account (`is_active=false`) rather than hard-deleting it.
@@ -221,7 +236,7 @@ After=network.target
 Type=simple
 User=collab-editor
 WorkingDirectory=/opt/collab-editor
-ExecStart=/opt/collab-editor/.venv/bin/uvicorn server.app.main:app --host 127.0.0.1 --port 8000
+ExecStart=/opt/collab-editor/.venv/bin/uvicorn server.app.main:app --host 127.0.0.1 --port 8000 --proxy-headers
 Restart=on-failure
 RestartSec=5
 
@@ -261,9 +276,11 @@ server {
     }
 
     location /api/ {
+        client_max_body_size 10m;  # match COLLAB_EDITOR_MAX_BODY_BYTES (nginx default is 1m)
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;  # per-user rate limiting
     }
 
     location /ws/ {
@@ -272,6 +289,7 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_read_timeout 3600s;  # long-lived collaboration sessions
     }
 }
@@ -305,17 +323,43 @@ If the frontend and backend are on different origins:
   VITE_API_BASE=https://api.example.com/api VITE_WS_BASE=wss://api.example.com npm run build
   ```
 
-### Known limitations to be aware of before going live
+### Hardening settings
 
-- The session cookie is `HttpOnly`/`SameSite=Lax` but not marked `Secure` — harmless as
-  long as TLS is terminated at the reverse proxy (the browser-facing connection is what
-  matters), but don't serve this directly over plain HTTP in production.
-- There's no admin UI yet — account management is via the CLI (first admin only) and the
-  `/api/admin/*` REST endpoints directly.
-- `create-admin` has no non-interactive/scripted mode (no flags, no env vars) — it's
-  meant for one manual run over SSH.
-- No rate limiting, no request body size cap, and no import size/entry-count limits exist
-  anywhere in the stack. Fine for a small trusted group; don't expose this to the open
-  internet as-is if that's a concern for you.
-- Single-process, in-memory room registry for realtime sync — sized for a small trusted
-  group, not for horizontal scaling.
+All optional; set in the systemd unit's `Environment=` lines.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `COLLAB_EDITOR_COOKIE_SECURE` | `true` | `Secure` flag on the session cookie. Set `0` only for plain-HTTP local dev. |
+| `COLLAB_EDITOR_MAX_BODY_BYTES` | `10485760` | Max HTTP request body (413 beyond). |
+| `COLLAB_EDITOR_IMPORT_MAX_ENTRIES` | `5000` | Max entries in an imported zip. |
+| `COLLAB_EDITOR_IMPORT_MAX_UNCOMPRESSED_BYTES` | `52428800` | Max total uncompressed import size. |
+| `COLLAB_EDITOR_LOGIN_RATE_LIMIT` | `10` | Failed logins per window per IP (429 beyond; `0` disables). Successful logins aren't counted. |
+| `COLLAB_EDITOR_ADMIN_RATE_LIMIT` | `120` | `/api/admin/*` requests per window, per signed-in user (unauthenticated requests use a separate per-IP bucket). |
+| `COLLAB_EDITOR_RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window. |
+| `COLLAB_EDITOR_RATE_LIMIT_ENABLED` | `true` | Master switch for rate limiting. |
+| `COLLAB_EDITOR_REDIS_URL` | unset | Enables multi-process realtime sync/presence/chat via Redis pub/sub. |
+
+### Multiple workers (Redis)
+
+By default rooms live in one process's memory. To run several workers, point
+`COLLAB_EDITOR_REDIS_URL` at a Redis instance on a **trusted network** (pub/sub traffic is
+unauthenticated beyond what Redis itself enforces) and use a shared docstore volume.
+
+### Remaining caveats
+
+- Passwords must be 8-256 characters (admin API, UI and `create-admin`). Login also rejects
+  passwords over 256 characters (422), so an account created earlier with a longer password
+  must be reset by an admin.
+- Failed logins and malformed login requests (e.g. 422) both count toward the login limit;
+  only successful logins are refunded.
+- Rate limiting is per process and keyed on the client IP. Behind nginx, run uvicorn with
+  `--proxy-headers` (and trusted `--forwarded-allow-ips`) or all users share one bucket.
+  A correct login from an IP already locked out by failed attempts still gets 429 until the
+  window expires. Limits aren't shared between workers.
+- Redis mode: cross-process "one open document per user" closing isn't atomic (two
+  simultaneous opens on different processes can close each other); doc state is persisted
+  as text, so edits from the last ~2s are lost if every process holding a room crashes; a
+  first open waits up to 0.5s for peers; the publish queue is unbounded in memory during a
+  long Redis outage, and batches are dropped after retries (state resyncs when Redis
+  returns); presence from a hard-killed process lingers ~15s; resync sends full doc state.
+  Redis pub/sub is unauthenticated beyond Redis itself, so keep it on a trusted network.

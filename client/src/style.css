@@ -674,3 +674,72 @@ body:not(.a11y-support-on) .file-tree [role="treeitem"][aria-expanded="true"]::b
   border-radius: 4px;
   background: var(--pane-bg);
 }
+
+/* --- Admin user management --- */
+
+.admin-dialog {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0;
+  color: var(--text);
+  background: var(--bg);
+  width: min(720px, 92vw);
+  max-height: 85vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.admin-dialog[open] {
+  display: block;
+}
+
+.admin-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.admin-dialog h2 {
+  margin: 0;
+  padding: 16px 20px 4px;
+  font-size: 16px;
+}
+
+.admin-status {
+  overflow-wrap: anywhere;
+  margin: 0;
+  padding: 0 20px;
+  min-height: 1.4em;
+}
+
+.admin-table-wrap {
+  overflow-x: auto;
+}
+
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.admin-table th,
+.admin-table td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.admin-table td:last-child {
+  white-space: nowrap;
+}
+
+.admin-form label:not(.settings-checkbox-row) {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+
+.admin-form-buttons {
+  display: flex;
+  gap: 8px;
+}

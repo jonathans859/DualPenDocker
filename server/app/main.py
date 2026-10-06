@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from server.app.db import init_db
+from server.app.limits import BodySizeLimitMiddleware
 from server.app.routers import admin, auth, documents, presence, sync
 
 
@@ -25,6 +26,7 @@ app = FastAPI(lifespan=lifespan)
 _default_origins = "http://localhost:5173,http://localhost:5174"
 allow_origins = [o.strip() for o in os.environ.get("COLLAB_EDITOR_CORS_ORIGINS", _default_origins).split(",") if o.strip()]
 
+app.add_middleware(BodySizeLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,

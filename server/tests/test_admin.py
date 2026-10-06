@@ -1,3 +1,5 @@
+import pytest
+
 async def test_list_users_requires_admin(user_client):
     resp = await user_client.get("/api/admin/users")
     assert resp.status_code == 403
@@ -74,3 +76,33 @@ async def test_admin_can_reset_password(admin_client, client, normal_user):
 
     resp = await client.post("/api/login", json={"username": "alice", "password": "newpass456"})
     assert resp.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"username": "  ", "display_name": "X", "initial_password": "longenough1"},
+        {"username": "u" * 65, "display_name": "X", "initial_password": "longenough1"},
+        {"username": "zed", "display_name": "   ", "initial_password": "longenough1"},
+        {"username": "zed", "display_name": "d" * 101, "initial_password": "longenough1"},
+        {"username": "zed", "display_name": "Zed", "initial_password": "short"},
+        {"username": "zed", "display_name": "Zed", "initial_password": "p" * 257},
+    ],
+)
+async def test_create_user_validation_422(admin_client, body):
+    assert (await admin_client.post("/api/admin/users", json=body)).status_code == 422
+
+
+async def test_create_user_strips_fields(admin_client):
+    resp = await admin_client.post(
+        "/api/admin/users",
+        json={"username": "  zed  ", "display_name": " Zed ", "initial_password": "longenough1"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["username"] == "zed" and resp.json()["display_name"] == "Zed"
+
+
+async def test_update_user_validation_422(admin_client, normal_user):
+    url = f"/api/admin/users/{normal_user.id}"
+    assert (await admin_client.patch(url, json={"display_name": "  "})).status_code == 422
+    assert (await admin_client.patch(url, json={"new_password": "short"})).status_code == 422
