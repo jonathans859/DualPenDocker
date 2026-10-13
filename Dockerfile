@@ -69,6 +69,16 @@ ENV COLLAB_EDITOR_DATABASE_URL=sqlite+aiosqlite:////data/db/app.db \
     COLLAB_EDITOR_BACKUP_PATH=/data/backups \
     DUALPEN_CLIENT_DIST=/app/client/dist
 
+# Upstream rate-limits failed logins and guest joins per client IP. This
+# container only ever sees the reverse proxy as its peer (it publishes on
+# loopback, see compose.yaml), so without this every user would share the
+# proxy's single bucket and a few bad passwords would lock everyone out.
+# With it, the limit keys on the last X-Forwarded-For entry - the one the
+# proxy appended, which a client cannot forge. Both proxy configs in
+# DOCKER.md set that header. With no header present it falls back to the
+# direct peer, i.e. upstream's default behaviour.
+ENV COLLAB_EDITOR_TRUST_FORWARDED_FOR=true
+
 WORKDIR /app
 
 COPY --from=deps /opt/venv /opt/venv
