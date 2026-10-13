@@ -10,12 +10,21 @@ _db_path = Path(_tmp_dir) / "test.db"
 os.environ["COLLAB_EDITOR_DATABASE_URL"] = f"sqlite+aiosqlite:///{_db_path}"
 os.environ["COLLAB_EDITOR_MASTER_KEY_PATH"] = str(Path(_tmp_dir) / "master.key")
 os.environ["COLLAB_EDITOR_DOCSTORE_PATH"] = str(Path(_tmp_dir) / "docstore")
+# Test client talks plain http; a Secure cookie would never be sent back.
+os.environ["COLLAB_EDITOR_COOKIE_SECURE"] = "0"
 
 from httpx import ASGITransport, AsyncClient
 
+from server.app import limits
 from server.app.db import AsyncSessionLocal, engine, init_db
 from server.app.main import app
 from server.app.user_service import create_user
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    limits.reset_rate_limits()
+    yield
 
 
 @pytest_asyncio.fixture(autouse=True)

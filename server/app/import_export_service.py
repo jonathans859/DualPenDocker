@@ -1,6 +1,9 @@
 import io
+import os
 import zipfile
+import zlib
 
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.app import docstore, node_service
@@ -10,6 +13,32 @@ from server.app.schemas import validate_node_name
 
 class InvalidZipError(Exception):
     pass
+
+
+class ImportTooLargeError(Exception):
+    pass
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _max_uncompressed() -> int:
+    return _env_int("COLLAB_EDITOR_IMPORT_MAX_UNCOMPRESSED_BYTES", 50 * 1024 * 1024)
+
+
+def _check_zip_limits(zf: zipfile.ZipFile) -> None:
+    """Rejects zip bombs up front using declared entry count and sizes; the
+    read loop also bounds actual bytes read, since declared sizes can lie."""
+    max_entries = _env_int("COLLAB_EDITOR_IMPORT_MAX_ENTRIES", 5000)
+    infos = zf.infolist()
+    if len(infos) > max_entries:
+        raise ImportTooLargeError(f"zip has too many entries (limit {max_entries})")
+    if sum(i.file_size for i in infos) > _max_uncompressed():
+        raise ImportTooLargeError(f"zip uncompressed size exceeds limit ({_max_uncompressed()} bytes)")
 
 
 def _split_and_validate_path(zip_path: str) -> list[str] | None:
@@ -45,13 +74,51 @@ async def import_zip(
     except zipfile.BadZipFile as e:
         raise InvalidZipError("not a valid zip file") from e
 
+    _check_zip_limits(zf)
+
     root_name = zip_filename[:-4] if zip_filename.lower().endswith(".zip") else zip_filename
     try:
         root_name = validate_node_name(root_name)
     except ValueError:
         root_name = "Imported"
 
+    created: list[tuple[str, str | None]] = []
+    try:
+        root = await _import_entries(db, zf, root_name, parent_id, created)
+    except Exception as e:
+        await _rollback_import(db, created)
+        # zipfile reports encrypted entries as RuntimeError; other RuntimeErrors
+        # are server faults and must not be blamed on the upload.
+        unreadable = isinstance(e, (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError)) or (
+            isinstance(e, RuntimeError) and "password" in str(e).lower()
+        )
+        if unreadable and not isinstance(e, ImportTooLargeError):
+            raise InvalidZipError(f"could not read zip contents: {e}") from e
+        raise
+    return root[0], root[1]
+
+
+async def _rollback_import(db: AsyncSession, created: list[tuple[str, str | None]]) -> None:
+    """Removes every node (and blob) created by a failed import so no partial
+    root folder is left behind."""
+    await db.rollback()
+    ids = [i for i, _ in created]
+    blobs = [b for _, b in created if b]
+    if ids:
+        await db.execute(delete(Node).where(Node.id.in_(ids)))
+        await db.commit()
+    for blob in blobs:
+        try:
+            docstore.delete_document(blob)
+        except OSError:
+            pass
+
+
+async def _import_entries(
+    db: AsyncSession, zf: zipfile.ZipFile, root_name: str, parent_id: str | None, created: list[tuple[str, str | None]]
+) -> tuple[Node, list[str]]:
     root = await node_service.create_folder(db, root_name, parent_id)
+    created.append((root.id, None))
 
     # Maps a validated folder-path tuple (relative to the zip root) to the
     # Node id already created for it, so multiple files under the same
@@ -63,10 +130,13 @@ async def import_zip(
             return folder_ids[path]
         parent = await _ensure_folder(path[:-1])
         folder = await node_service.create_folder(db, path[-1], parent)
+        created.append((folder.id, None))
         folder_ids[path] = folder.id
         return folder.id
 
     skipped: list[str] = []
+    max_total = _max_uncompressed()
+    total_read = 0
 
     for info in zf.infolist():
         if info.is_dir():
@@ -81,7 +151,11 @@ async def import_zip(
             skipped.append(info.filename)
             continue
 
-        raw_bytes = zf.read(info)
+        with zf.open(info) as fh:
+            raw_bytes = fh.read(max_total - total_read + 1)
+        total_read += len(raw_bytes)
+        if total_read > max_total:
+            raise ImportTooLargeError(f"zip uncompressed size exceeds limit ({max_total} bytes)")
         try:
             content = raw_bytes.decode("utf-8")
         except UnicodeDecodeError:
@@ -93,6 +167,7 @@ async def import_zip(
         parent_folder_id = await _ensure_folder(folder_path)
 
         document = await node_service.create_document(db, file_name, parent_folder_id)
+        created.append((document.id, document.blob_path))
         if content:
             await node_service.set_document_content(db, document.id, content)
 

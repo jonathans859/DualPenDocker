@@ -8,7 +8,9 @@ cryptography==50.0.0
 SQLAlchemy==2.0.52
 aiosqlite==0.22.1
 python-multipart==0.0.20
+redis==8.1.0
 
 pytest==9.1.1
 pytest-asyncio==1.4.0
 httpx==0.28.1
+fakeredis==2.39.0
