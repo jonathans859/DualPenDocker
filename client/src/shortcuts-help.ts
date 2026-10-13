@@ -1,18 +1,22 @@
+// macOS labels the Alt key "Option".
+const ALT = /Mac|iPhone|iPad/.test(navigator.platform) ? "Option" : "Alt";
+
 const SHORTCUT_GROUPS: { title: string; items: [string, string][] }[] = [
   {
     title: "Editor & document",
     items: [
       ["F6", "Move focus between file tree and editor"],
-      ["Alt+J", "Jump to next collaborator's cursor"],
+      [`${ALT}+J`, "Jump to next collaborator's cursor"],
       ["F2", "Quick chat composer"],
       ["Shift+F2", "Open full chat panel"],
       ["Ctrl+F", "Find in current document"],
       ["Ctrl+H", "Find and replace in current document"],
       ["F3 / Shift+F3", "Next / previous match"],
-      ["Alt+R", "Open markdown preview of current document in a new tab"],
-      ["Alt+W", "Announce who's online"],
+      [`${ALT}+R`, "Open markdown preview of current document in a new tab"],
+      [`${ALT}+O`, "Outline of headings in current document"],
+      [`${ALT}+W`, "Announce who's online"],
       ["Ctrl+M", "Toggle Tab moves focus vs. inserts tab (editor)"],
-      ["F1 / Alt+F1", "Show this help"],
+      [`F1 / ${ALT}+F1`, "Show this help"],
     ],
   },
   {

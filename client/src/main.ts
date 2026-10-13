@@ -18,7 +18,7 @@ import { MonacoBinding } from "y-monaco";
 import * as api from "./api";
 import type { NodeOut } from "./api";
 import { FileTree } from "./tree";
-import { DocSyncConnection, CLOSE_REPLACED_BY_NEWER_SESSION } from "./sync";
+import { DocSyncConnection, CLOSE_FORBIDDEN, CLOSE_REPLACED_BY_NEWER_SESSION } from "./sync";
 import type { ChatMessage } from "./sync";
 import { attachRemoteCursorStyles } from "./remote-cursors";
 import {
@@ -42,8 +42,12 @@ import { MarkdownPreviewPanel } from "./markdown-preview";
 import { attachDocCollaboratorsList, type DocCollaboratorsList } from "./doc-collaborators";
 import { PresenceRosterPanel } from "./presence-roster";
 import { ShortcutsHelpPanel } from "./shortcuts-help";
+import { OutlineViewPanel } from "./outline-view";
+import { AdminPanel } from "./admin";
+import { ShareDialog, clearJoinHash, joinTokenFromHash, renderJoinForm } from "./share";
 
-const TRASH_FOLDER_NAME = "Trash";
+// Set from /api/config on startup so the client and server agree on which folder is Trash.
+let trashFolderName = "Trash";
 // Idle threshold after the last keystroke before a peer's isTyping flips back
 // to false, matching the "clean boolean edge, not a raw timestamp" design so
 // peers don't each have to interpret staleness themselves.
@@ -80,6 +84,9 @@ let settingsPanel: SettingsPanel | null = null;
 let markdownPreviewPanel: MarkdownPreviewPanel | null = null;
 let presenceRosterPanel: PresenceRosterPanel | null = null;
 let shortcutsHelpPanel: ShortcutsHelpPanel | null = null;
+let outlineViewPanel: OutlineViewPanel | null = null;
+let adminPanel: AdminPanel | null = null;
+let shareDialog: ShareDialog | null = null;
 let treeRefreshTimer: number | null = null;
 // Tracks whether #move-status's live-region text was last set for "moving"
 // or "not moving", so updateTreeToolbar() (which reruns on every arrow-key
@@ -216,7 +223,7 @@ async function openDocument(node: NodeOut): Promise<void> {
       });
       const initialPosition = monacoEditor.getPosition();
       if (initialPosition) setLocalAwarenessCursor(sync, initialPosition, false);
-      monacoEditor.updateOptions({ readOnly: false });
+      monacoEditor.updateOptions({ readOnly: currentUser?.guest_read_only ?? false });
       statusEl.textContent = "";
       monacoEditor.focus();
     },
@@ -229,7 +236,9 @@ async function openDocument(node: NodeOut): Promise<void> {
       statusEl.textContent =
         closeCode === CLOSE_REPLACED_BY_NEWER_SESSION
           ? "This document was closed because you opened another document in a different tab or window."
-          : "Failed to load document";
+          : closeCode === CLOSE_FORBIDDEN
+            ? "Access to this shared document was revoked."
+            : "Failed to load document";
     },
     (message: ChatMessage) => {
       if (generation !== openGeneration) return;
@@ -334,7 +343,7 @@ async function renameNode(nodeId: string, newName: string): Promise<void> {
 async function deleteToTrash(node: NodeOut): Promise<void> {
   if (!fileTree) return;
 
-  const trash = fileTree.findRootFolderByName(TRASH_FOLDER_NAME);
+  const trash = fileTree.findRootFolderByName(trashFolderName);
   const inTrash = !!trash && fileTree.isDescendantOfNode(node.id, trash.id);
 
   if (inTrash) {
@@ -348,8 +357,8 @@ async function moveToTrash(node: NodeOut): Promise<void> {
   if (!fileTree) return;
 
   try {
-    const trash = fileTree.findRootFolderByName(TRASH_FOLDER_NAME);
-    const trashId = trash ? trash.id : (await api.createFolder(TRASH_FOLDER_NAME, null)).id;
+    const trash = fileTree.findRootFolderByName(trashFolderName);
+    const trashId = trash ? trash.id : (await api.createFolder(trashFolderName, null)).id;
 
     const pathPrefix = fileTree.getAncestorPath(node.id).join("-");
     const trashedName = pathPrefix ? `${pathPrefix}-${node.name}` : node.name;
@@ -436,7 +445,7 @@ function updateTreeToolbar(active: NodeOut | null, markedForMove: NodeOut | null
   if (!renameBtn || !moveBtn || !pasteBtn || !cancelBtn || !deleteBtn || !exportSelectedBtn || !statusEl) return;
 
   const moving = markedForMove !== null;
-  const trash = fileTree?.findRootFolderByName(TRASH_FOLDER_NAME) ?? null;
+  const trash = fileTree?.findRootFolderByName(trashFolderName) ?? null;
   const activeInTrash = !!active && !!trash && fileTree!.isDescendantOfNode(active.id, trash.id);
 
   renameBtn.disabled = !active || moving;
@@ -489,13 +498,14 @@ function setUpTreePolling(): void {
 }
 
 async function renderApp(): Promise<void> {
+  const isGuest = currentUser?.is_guest ?? false;
   app.innerHTML = `
-    <div class="app-shell">
+    <div class="app-shell${isGuest ? " guest-mode" : ""}">
       <header class="app-header">
         <h1>DualPen</h1>
         <div class="header-right">
           <span id="user-info"></span>
-          <button id="presence-btn" type="button">Who's online</button>
+          ${isGuest ? "" : '<button id="presence-btn" type="button">Who\'s online</button>'}
           <button id="logout-btn" type="button">Log out</button>
         </div>
       </header>
@@ -525,7 +535,10 @@ async function renderApp(): Promise<void> {
             <span id="editor-title">No document open</span>
             <span id="tab-focus-indicator" role="status">Tab moves focus: OFF</span>
             <span id="doc-collaborators" role="status"></span>
+            ${isGuest ? "" : '<button id="share-btn" type="button">Share</button>'}
+            <button id="outline-btn" type="button">Outline</button>
             <button id="settings-btn" type="button">Settings</button>
+            ${currentUser?.is_admin ? '<button id="admin-btn" type="button">Admin</button>' : ""}
             <span id="save-status" role="status"></span>
           </div>
           <div id="editor-container" role="none"></div>
@@ -535,7 +548,9 @@ async function renderApp(): Promise<void> {
   `;
 
   const userInfo = document.querySelector<HTMLElement>("#user-info")!;
-  userInfo.textContent = currentUser ? `Signed in as ${currentUser.display_name}` : "";
+  userInfo.textContent = currentUser
+    ? `Signed in as ${currentUser.display_name}${isGuest ? (currentUser.guest_read_only ? " (guest, view only)" : " (guest)") : ""}`
+    : "";
 
   document.querySelector<HTMLButtonElement>("#logout-btn")!.addEventListener("click", async () => {
     await api.logout();
@@ -630,11 +645,42 @@ async function renderApp(): Promise<void> {
   setUpChat();
   setUpSettings();
   setUpMarkdownPreview();
-  setUpPresenceRoster();
   setUpShortcutsHelp();
+  setUpOutlineView();
+
+  if (isGuest) {
+    // Guests only get their one document: no tree, roster or admin (the server refuses them anyway).
+    const docId = currentUser!.guest_doc_id!;
+    void openDocument({
+      id: docId,
+      parent_id: null,
+      name: currentUser!.guest_doc_name ?? "Shared document",
+      kind: "document",
+      created_at: "",
+      updated_at: "",
+    });
+    return;
+  }
+
+  try {
+    trashFolderName = (await api.getConfig()).trash_folder_name;
+  } catch {
+    // keep the default; the server still enforces its own name
+  }
+  setUpPresenceRoster();
+  setUpAdmin();
+  setUpShare();
   setUpTreePolling();
 
   await refreshTree();
+}
+
+function setUpShare(): void {
+  if (!shareDialog) shareDialog = new ShareDialog({ announce });
+  document.querySelector<HTMLButtonElement>("#share-btn")!.addEventListener("click", () => {
+    if (currentDocument) void shareDialog?.open(currentDocument.id);
+    else announce("Open a document first to share it");
+  });
 }
 
 function hasOtherPeersInCurrentDoc(): boolean {
@@ -674,11 +720,30 @@ function setUpMonaco(): void {
   if (!container) return;
 
   currentModel = monaco.editor.createModel("", "plaintext");
+  // The "off" side of the accessibility toggle is "auto", not "off". Monaco
+  // documents "off" as "Assume a screen reader is not attached", and maps it
+  // to AccessibilitySupport.Disabled - which makes it replace the
+  // screen-reader content's aria-label with "The editor is not accessible at
+  // this time." (see monaco-editor's screenReaderUtils.js). That turns the
+  // toggle's off position into a dead end for anyone using a screen reader
+  // who hasn't found the setting yet. "auto" is Monaco's own default and
+  // leaves the real aria-label in place. It won't enable the screen-reader
+  // optimized path on its own - no browser API reports screen-reader
+  // presence, so "auto" stays Unknown on the web and the toggle still has to
+  // be on for that - but off now means "not optimized" rather than "actively
+  // announced as broken".
   monacoEditor = monaco.editor.create(container, {
     model: currentModel,
     automaticLayout: true,
     readOnly: true,
-    accessibilitySupport: loadAccessibilitySupportPref() ? "on" : "off",
+    accessibilitySupport: loadAccessibilitySupportPref() ? "on" : "auto",
+    // Monaco fills its screen-reader textarea with a page of accessibilityPageSize
+    // lines (default 500), and VoiceOver reads that whole field rather than the
+    // line the cursor is on. A page of 1 makes the field hold only the current
+    // line, so "read the whole field" and "read the current line" coincide. The
+    // trade-off is that a screen reader can no longer review surrounding lines
+    // from the field - acceptable here, since the editor is line-oriented.
+    accessibilityPageSize: loadAccessibilitySupportPref() ? 1 : 500,
     fontFamily: loadFontFamily(),
     fontSize: loadFontSize(),
   });
@@ -698,17 +763,37 @@ function setUpMonaco(): void {
     focusTreePane();
   });
 
-  // Monaco's find feature binds Alt+R (toggle regex in the find widget) once
-  // imported, which swallows our window-level Alt+R markdown-preview shortcut
-  // whenever the editor has focus. Re-bind it here so it works from the
-  // editor too - same reasoning as F6 above.
-  monacoEditor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.KeyR, () => {
-    if (!currentModel || !currentDocument) return;
-    markdownPreviewPanel?.open(currentModel.getValue(), currentDocument.name);
-  });
-
+  restrictFindToggleKeybindings();
   bindCtrlArrowWordNavigation(monacoEditor);
   bindVerticalArrowTracking(monacoEditor);
+}
+
+// Monaco's find feature binds Alt+C/W/R/L/P (Cmd+Alt+... on macOS) to toggle
+// its search options whenever the editor has focus, which swallows our
+// window-level Alt+W/Alt+R shortcuts and silently flips find settings while
+// typing. Re-scope them to only fire while focus is inside the find widget.
+// Keybinding rules are global to Monaco, so this only needs to run once.
+let findTogglesRestricted = false;
+function restrictFindToggleKeybindings(): void {
+  if (findTogglesRestricted) return;
+  findTogglesRestricted = true;
+
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
+  const modifiers = isMac ? monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt : monaco.KeyMod.Alt;
+  const toggles: [string, monaco.KeyCode][] = [
+    ["toggleFindCaseSensitive", monaco.KeyCode.KeyC],
+    ["toggleFindWholeWord", monaco.KeyCode.KeyW],
+    ["toggleFindRegex", monaco.KeyCode.KeyR],
+    ["toggleFindInSelection", monaco.KeyCode.KeyL],
+    ["togglePreserveCase", monaco.KeyCode.KeyP],
+  ];
+  monaco.editor.addKeybindingRules(
+    toggles.flatMap(([command, keyCode]) => [
+      // keybinding 0 removes every default binding for the command.
+      { keybinding: 0, command: `-${command}` },
+      { keybinding: modifiers | keyCode, command, when: "findWidgetFocused" },
+    ]),
+  );
 }
 
 // Monaco's default Ctrl+Left/Right keybinding for cursorWordEndLeft/Right
@@ -724,9 +809,21 @@ function setUpMonaco(): void {
 // queued unmodified arrow keypress finally moves the cursor by one
 // character, which reads as a "snap back". This binds Ctrl+Left/Right (and
 // Ctrl+Shift+Left/Right for extending the selection) directly to the plain
-// word commands, bypassing Monaco's self-disabling default entirely so the
-// keys work regardless of accessibility mode or OS.
+// word commands, bypassing Monaco's self-disabling default.
+//
+// Windows only, for two reasons. The `isWindows` half of that kbExpr means
+// the default never disables itself anywhere else, so there is nothing to
+// work around on macOS or Linux - Monaco's own binding is live and correct.
+// And monaco.KeyMod.CtrlCmd is Command, not Control, on macOS (see
+// keybindings.js: `metaKey = OS === Macintosh ? ctrlCmd : winCtrl`), so
+// binding it unconditionally stole Cmd+Left/Right - line start/end on a Mac -
+// and made it move by word instead, while Option+Left/Right kept working via
+// the untouched default. Monaco spells the platform split with a `mac:`
+// override on its own registration; here the whole workaround simply doesn't
+// apply off Windows.
 function bindCtrlArrowWordNavigation(editor: monaco.editor.IStandaloneCodeEditor): void {
+  if (!isWindows()) return;
+
   const bind = (keybinding: number, commandId: string) => {
     editor.addCommand(keybinding, () => {
       editor.trigger("wordNavigation", commandId, null);
@@ -743,6 +840,16 @@ function bindCtrlArrowWordNavigation(editor: monaco.editor.IStandaloneCodeEditor
     monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.RightArrow,
     "cursorWordStartRightSelect",
   );
+}
+
+// navigator.userAgentData is Chromium-only, so fall back to userAgent, which
+// reports "Windows NT" on every Windows browser including Firefox and the
+// Windows builds Monaco's own IsWindowsContext keys off.
+function isWindows(): boolean {
+  const platform = (navigator as Navigator & { userAgentData?: { platform?: string } })
+    .userAgentData?.platform;
+  if (platform) return platform === "Windows";
+  return navigator.userAgent.includes("Windows");
 }
 
 // Monaco's onDidChangeCursorSelection event doesn't say which key caused the
@@ -779,7 +886,10 @@ function setUpSettings(): void {
   if (!settingsPanel) {
     settingsPanel = new SettingsPanel({
       onAccessibilitySupportChange: (on) => {
-        monacoEditor?.updateOptions({ accessibilitySupport: on ? "on" : "off" });
+        monacoEditor?.updateOptions({
+          accessibilitySupport: on ? "on" : "auto",
+          accessibilityPageSize: on ? 1 : 500,
+        });
       },
       onFontChange: (family, size) => {
         monacoEditor?.updateOptions({ fontFamily: family, fontSize: size });
@@ -794,6 +904,14 @@ function setUpSettings(): void {
   document.querySelector<HTMLButtonElement>("#settings-btn")!.addEventListener("click", () => {
     settingsPanel?.openFocused();
   });
+}
+
+function setUpAdmin(): void {
+  const btn = document.querySelector<HTMLButtonElement>("#admin-btn");
+  if (!btn) return;
+  // Guarded singleton like setUpSettings(); dialog lives outside #app.
+  if (!adminPanel) adminPanel = new AdminPanel(() => currentUser?.id ?? null);
+  btn.addEventListener("click", () => void adminPanel?.open());
 }
 
 function setUpMarkdownPreview(): void {
@@ -826,6 +944,27 @@ function setUpShortcutsHelp(): void {
   if (!shortcutsHelpPanel) {
     shortcutsHelpPanel = new ShortcutsHelpPanel();
   }
+}
+
+function setUpOutlineView(): void {
+  // Same guarded-singleton reasoning as the other panels above.
+  if (!outlineViewPanel) {
+    outlineViewPanel = new OutlineViewPanel({
+      getModel: () => currentModel,
+      onJump: (lineNumber) => {
+        if (!monacoEditor) return;
+        monacoEditor.setPosition({ lineNumber, column: 1 });
+        monacoEditor.revealLineInCenter(lineNumber);
+        monacoEditor.focus();
+        announce(`Line ${lineNumber}`);
+      },
+      announce,
+    });
+  }
+
+  document.querySelector<HTMLButtonElement>("#outline-btn")!.addEventListener("click", () => {
+    outlineViewPanel?.open();
+  });
 }
 
 function focusEditorPane(): void {
@@ -861,21 +1000,28 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
+// On macOS, Option+letter composes a character (Option+W -> "∑"), so e.key
+// no longer names the letter. Fall back to the physical key code.
+function isAltLetter(e: KeyboardEvent, letter: string): boolean {
+  if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return false;
+  return e.key.toLowerCase() === letter || e.code === `Key${letter.toUpperCase()}`;
+}
+
 // Registered once at module scope, like the F6 handler above, so it works
 // regardless of which pane currently has focus (though it's only meaningful
 // while a document with an active sync connection is open).
 window.addEventListener("keydown", (e) => {
-  if (e.key !== "j" && e.key !== "J") return;
-  if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (!isAltLetter(e, "j")) return;
   if (!monacoEditor || !currentSync || !collaboratorCycler) return;
 
+  // Before the no-peer early return, so Option+J on macOS doesn't type "∆".
+  e.preventDefault();
   const peer = collaboratorCycler.next(currentSync.awareness);
   if (!peer) {
     announce("No one else is editing this document.");
     return;
   }
 
-  e.preventDefault();
   const position = { lineNumber: peer.lineNumber, column: peer.column };
   monacoEditor.setPosition(position);
   monacoEditor.revealPositionInCenter(position);
@@ -909,8 +1055,7 @@ window.addEventListener("keydown", (e) => {
 // Alt+R: markdown preview of the current document. Registered once at
 // module scope like the other global shortcuts above.
 window.addEventListener("keydown", (e) => {
-  if (e.key !== "r" && e.key !== "R") return;
-  if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (!isAltLetter(e, "r")) return;
   if (!currentModel || !currentDocument) return;
 
   e.preventDefault();
@@ -923,11 +1068,19 @@ window.addEventListener("keydown", (e) => {
 // panel instead of just reading a summary aloud. Registered once at module
 // scope like the others.
 window.addEventListener("keydown", (e) => {
-  if (e.key !== "w" && e.key !== "W") return;
-  if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (!isAltLetter(e, "w")) return;
 
   e.preventDefault();
   void presenceRosterPanel?.openOrAnnounceIfEmpty();
+});
+
+// Alt+O: outline of the current document's headings. preventDefault comes
+// first so Option+O on macOS doesn't type "ø" into the editor.
+window.addEventListener("keydown", (e) => {
+  if (!isAltLetter(e, "o")) return;
+
+  e.preventDefault();
+  outlineViewPanel?.open();
 });
 
 // F1 (or Alt+F1 as a fallback, since some browsers/OSes intercept bare F1
@@ -943,7 +1096,34 @@ window.addEventListener("keydown", (e) => {
   shortcutsHelpPanel?.open();
 });
 
+async function openSharedLink(token: string): Promise<void> {
+  // A signed-in member just opens the document; their own session is never replaced by a guest one.
+  try {
+    const member = await api.me();
+    if (!member.is_guest) {
+      const link = await api.getShareLink(token);
+      clearJoinHash();
+      currentUser = member;
+      await renderApp();
+      const node = fileTree?.getNode(link.doc_id);
+      if (node) void openDocument(node);
+      return;
+    }
+  } catch {
+    // not signed in, or link unknown to members: fall through to the guest join form
+  }
+  renderJoinForm(app, token, async (user) => {
+    currentUser = user;
+    await renderApp();
+  });
+}
+
 async function init(): Promise<void> {
+  const joinToken = joinTokenFromHash();
+  if (joinToken) {
+    await openSharedLink(joinToken);
+    return;
+  }
   try {
     currentUser = await api.me();
     await renderApp();

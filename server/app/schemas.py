@@ -1,7 +1,9 @@
 import datetime
 import re
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 # Reject characters Windows/most filesystems forbid in a single path segment,
 # so names stay portable if documents are ever exported to real files.
@@ -26,22 +28,35 @@ class UserOut(BaseModel):
     is_admin: bool
     is_active: bool
     created_at: datetime.datetime
+    is_guest: bool = False
+    guest_doc_id: str | None = None
+    guest_doc_name: str | None = None
+    guest_read_only: bool = False
+
+
+PASSWORD_MIN_LENGTH = 8
+PASSWORD_MAX_LENGTH = 256
 
 
 class LoginRequest(BaseModel):
     username: str
-    password: str
+    password: str = Field(max_length=PASSWORD_MAX_LENGTH)
+
+
+Username = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+DisplayName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+Password = Annotated[str, Field(min_length=PASSWORD_MIN_LENGTH, max_length=PASSWORD_MAX_LENGTH)]
 
 
 class CreateUserRequest(BaseModel):
-    username: str
-    display_name: str
-    initial_password: str
+    username: Username
+    display_name: DisplayName
+    initial_password: Password
 
 
 class UpdateUserRequest(BaseModel):
-    display_name: str | None = None
-    new_password: str | None = None
+    display_name: DisplayName | None = None
+    new_password: Password | None = None
     is_admin: bool | None = None
     is_active: bool | None = None
 
@@ -114,3 +129,23 @@ class ChatMessageOut(BaseModel):
 class ImportZipResultOut(BaseModel):
     root: NodeOut
     skipped: list[str]
+
+
+class ShareLinkOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    token: str
+    doc_id: str
+    read_only: bool
+    expires_at: datetime.datetime | None = None
+    created_at: datetime.datetime
+
+
+class CreateShareLinkRequest(BaseModel):
+    read_only: bool = False
+    # None = the link never expires. Expiry only stops new joins; existing guests keep their 24h session.
+    expires_in_hours: int | None = Field(default=None, ge=1, le=8760)
+
+
+class JoinRequest(BaseModel):
+    display_name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]

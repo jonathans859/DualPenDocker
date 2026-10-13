@@ -17,17 +17,20 @@ services:
 
     # Upstream keeps the realtime sync rooms in one process's memory
     # (server/app/routers/sync.py), so a second replica would not see the
-    # first one's edits and collaborators would silently diverge. Never
-    # scale this service above 1.
+    # first one's edits and collaborators would silently diverge. Upstream
+    # can now fan out across processes via COLLAB_EDITOR_REDIS_URL, but this
+    # stack ships no Redis and keeps SQLite on one volume. Keep this at 1.
     deploy:
       replicas: 1
 
     ports:
       # Loopback only: your reverse proxy terminates TLS and should be the
-      # only thing that can reach this. The session cookie is not marked
-      # Secure upstream, so the browser-facing hop must be the proxy's HTTPS,
-      # never this port. Set DUALPEN_BIND=0.0.0.0 only if the proxy lives on
-      # another host and a firewall fronts it.
+      # only thing that can reach this. The session cookie is Secure, so
+      # logging in only works through the proxy's HTTPS (or on
+      # http://localhost in Chrome/Firefox). The image also trusts the last
+      # X-Forwarded-For entry for rate limiting, so set DUALPEN_BIND=0.0.0.0
+      # only if the proxy lives on another host and a firewall lets nothing
+      # else reach this port.
       - "${DUALPEN_BIND:-127.0.0.1}:${DUALPEN_PORT:-8000}:8000"
 
     volumes:

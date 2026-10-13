@@ -4,17 +4,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.app.auth import require_admin
 from server.app.db import get_db
-from server.app.models import User
+from server.app.limits import admin_rate_limit
+from server.app.models import GuestGrant, User
 from server.app.schemas import CreateUserRequest, UpdateUserRequest, UserOut
 from server.app.security import hash_password
 from server.app.user_service import create_user, UsernameTakenError
 
-router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(admin_rate_limit), Depends(require_admin)])
 
 
 @router.get("/users", response_model=list[UserOut])
 async def list_users(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).order_by(User.id))
+    result = await db.execute(select(User).where(User.id.not_in(select(GuestGrant.user_id))).order_by(User.id))
     return result.scalars().all()
 
 

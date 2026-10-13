@@ -38,7 +38,7 @@ first and only unclaimed paths fall through to static files.
 
 **Everything must stay on one origin.** That is a hard requirement, not a
 preference: `server/app/auth.py` sets the session cookie `SameSite=Lax`
-without the `Secure` flag, and browsers do not attach a `Lax` cookie to
+(and `Secure`), and browsers do not attach a `Lax` cookie to
 cross-site requests — so a split-origin deployment cannot log in at all, no
 matter how CORS is configured. Serving both halves from one process makes
 that impossible to get wrong.
@@ -67,8 +67,8 @@ docker compose logs -f app
 
 ## Creating accounts
 
-Upstream has no self-signup and no admin UI. The first admin is made with an
-interactive CLI prompt:
+Upstream has no self-signup. The first admin is made with an interactive CLI
+prompt:
 
 ```bash
 docker compose run --rm app python -m server.cli create-admin
@@ -78,7 +78,16 @@ It asks for a username, display name and password. Use `run --rm`, not
 `exec` — `run` allocates a TTY so `getpass` can read the password without
 echoing it.
 
-Everyone else is created afterwards through the admin REST API as that user
+For scripted provisioning, skip the prompt with flags and stdin instead
+(`-T` so Compose does not allocate a TTY that would swallow the pipe):
+
+```bash
+printf '%s' "$PW" | docker compose run --rm -T app \
+  python -m server.cli create-admin --username admin --password-stdin
+```
+
+Everyone else is created afterwards from the **Admin** button in the app's
+toolbar (visible to admins only), or through the admin REST API as that user
 (`POST /api/admin/users`), e.g.:
 
 ```bash
@@ -124,8 +133,10 @@ server {
     ssl_certificate     /etc/letsencrypt/live/editor.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/editor.example.com/privkey.pem;
 
-    # Zip import/export moves whole document trees; the default 1m is low.
-    client_max_body_size 64m;
+    # Zip import moves whole document trees; nginx's default 1m is low.
+    # Match the app's own cap (COLLAB_EDITOR_MAX_BODY_BYTES, 10 MiB by
+    # default) so oversize uploads get the app's 413, not nginx's.
+    client_max_body_size 10m;
 
     location / {
         proxy_pass http://127.0.0.1:8000;
@@ -138,6 +149,8 @@ server {
 
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
+        # Appends the real client address; the image keys its login and
+        # guest-join rate limits on this (COLLAB_EDITOR_TRUST_FORWARDED_FOR).
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
@@ -371,7 +384,16 @@ attention unless you are relocating data:
 | `COLLAB_EDITOR_DOCSTORE_PATH` | `/data/docstore` |
 | `COLLAB_EDITOR_MASTER_KEY_PATH` | `/data/master.key` |
 | `COLLAB_EDITOR_BACKUP_PATH` | `/data/backups` |
+| `COLLAB_EDITOR_TRUST_FORWARDED_FOR` | `true` — rate limits key on the proxy-appended `X-Forwarded-For` entry rather than the proxy's own address |
 | `DUALPEN_CLIENT_DIST` | `/app/client/dist` |
+
+Everything else keeps upstream's default and can be set under `environment:`
+in `compose.yaml`. The full list is in upstream's
+[README](README.md#hardening-settings). The ones you're most likely to touch are
+`COLLAB_EDITOR_MAX_BODY_BYTES` (10 MiB request cap),
+`COLLAB_EDITOR_LOGIN_RATE_LIMIT` (10 failed logins per minute per IP),
+`COLLAB_EDITOR_TRASH_FOLDER_NAME` and `COLLAB_EDITOR_COOKIE_SECURE` (set `0`
+only to test over plain HTTP on something other than `localhost`).
 
 `COLLAB_EDITOR_CORS_ORIGINS` is deliberately left unset. With a single origin
 the browser never issues a cross-origin request, so there is nothing for CORS
@@ -454,14 +476,14 @@ These come from upstream and none of them are changed by containerising it:
 - **Never run more than one replica.** Realtime sync rooms live in a single
   process's memory (`server/app/routers/sync.py`), so a second instance would
   not see the first's edits and collaborators would silently diverge.
-  `compose.yaml` pins `replicas: 1`.
-- **The session cookie is not marked `Secure`.** Fine behind a TLS-terminating
-  proxy, which is the only supported deployment, but do not serve this over
-  plain HTTP.
-- **No rate limiting, no request size cap, no import limits** anywhere in the
-  stack. Sized for a small trusted group, not the open internet.
-- **No admin UI.** Account management is the CLI plus the `/api/admin/*`
-  endpoints.
+  `compose.yaml` pins `replicas: 1`. Upstream supports several workers via
+  Redis (`COLLAB_EDITOR_REDIS_URL`), but this stack doesn't ship that.
+- **The session cookie is `Secure`.** Logging in needs HTTPS (the proxy) or
+  `http://localhost` in Chrome/Firefox. Safari, or a LAN IP over plain HTTP,
+  will silently fail to stay logged in.
+- **Rate limits are in-memory and per process.** They reset on restart. Login
+  and guest-join limits are keyed per client IP, which depends on your proxy
+  sending `X-Forwarded-For` (see above).
 - Static assets are served by Starlette without compression. It sets `ETag`
   and `Last-Modified`, so repeat visits revalidate into `304`s, but enable
   gzip on your proxy (Caddy does it by default; nginx needs `gzip on;` plus
