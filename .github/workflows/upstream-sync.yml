@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Check out full history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Needed for merge-base and rev-list against upstream.
           fetch-depth: 0
